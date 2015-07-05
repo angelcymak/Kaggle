@@ -1,0 +1,274 @@
+---
+title: "Titanic"
+author: "Angel Mak"
+date: "July 4, 2015"
+output: html_document
+---
+
+# Overview
+
+Goal :  
+Predict whether Titanic passenger survived(1) or not(0)
+
+Expected accuracy:  
+"Know that a score of 0.79 - 0.81 is doing well on this challenge, and 0.81-0.82 is really going beyond the basic models!" - https://www.kaggle.com/c/titanic/details/getting-started-with-random-forests  
+
+"most people above 0.85 are almost definitely cheating"
+https://www.kaggle.com/c/titanic/forums/t/4894/what-accuracy-should-i-be-aiming-for  
+
+Kaggle competitle homepage:  
+https://www.kaggle.com/c/titanic
+
+Data cleaning was done based on this tutorial:  
+https://github.com/wehrley/wehrley.github.io/blob/master/SOUPTONUTS.md
+
+# Import train and test data
+
+```{r, message=FALSE, warning=FALSE}
+library(caret) 
+library(gdata)
+library(Amelia) # for missingness plot
+library(Hmisc) # bystats
+set.seed(333)
+
+train.raw <- read.csv("/Users/angelmak/Dropbox/Kaggle/Titanic/train.csv",as.is=T,na.strings=c("NA",""))
+test.raw <- read.csv("/Users/angelmak/Dropbox/Kaggle/Titanic/test.csv",as.is=T,na.strings=c("NA",""))
+```
+
+# Data formatting
+
+  What the data originally look like
+```{r, message=FALSE, warning=FALSE}
+head(train.raw)
+summary(train.raw)
+```
+
+  A summary of data after converting variables to factor
+```{r, message=FALSE, warning=FALSE}
+train.clean <- train.raw
+convert2Factor <- function(df,col){
+  for (class in col){
+    df[,class] <- factor(df[,class])
+  }
+  return(df)
+}
+factor.col <- c('Survived','Pclass','Sex','Embarked')
+train.clean <- convert2Factor(train.clean,factor.col)
+summary(train.clean)
+```
+
+# (Some) exploratory analysis
+```{r, message=FALSE, warning=FALSE}
+# Find out how much missing data and choose predictors
+missmap(train.raw, main="Titanic Training Data - Missings Map", col=c("yellow", "black"), legend=FALSE)
+
+# Understand what might influence the outcome
+mosaicplot(train.clean$Pclass ~ train.clean$Survived, main="Passenger Fate by Traveling Class", shade=FALSE, color=TRUE, xlab="Pclass", ylab="Survived")
+```
+
+# Imputation of missing data
+
+  + Impute median age by title as imputeAge
+  + Impute Embarked by the most frequent value
+  + Impute suspicious or missing Fare by Pclass
+  + Group titles into higher level
+
+```{r}
+# Impute missing age using title
+getTitle <- function(data) {
+  #data <- train.raw
+  #data$Name
+  title.dot.start <- regexpr("\\,[A-Z ]{1,20}\\.", data$Name, TRUE)
+  title.comma.end <- title.dot.start + attr(title.dot.start, "match.length")-1
+  #data$Name[1]
+  #title.dot.start[1]
+  data$title <- substr(data$Name, title.dot.start+2, title.comma.end-1)
+  data$title[which(data$title == "Ms")] <- 'Mrs'
+  #data$title[which(data$title == "Mlle")] <- 'Mme'
+  return (factor(data$title))
+}
+
+#Age, title, title.na
+imputeMedian <- function(impute.var, filter.var, var.levels) {
+  for (v in var.levels) {
+    impute.var[which(filter.var == v)] <- impute(impute.var[which(filter.var == v)], what="median")
+  }
+  return (impute.var)
+}
+
+imputeAgeByTitle <- function(df){
+  age.stat <- bystats(df$Age, df$title,fun=function(x)c(Mean=mean(x),Median=median(x)))
+  title.na <- names(age.stat[age.stat[,"Missing"]>0,"N"])
+  title.i <- which(title.na == "ALL")
+  title.na <- title.na[-title.i]
+  df$imputeAge <- imputeMedian(df$Age, df$title, title.na)
+  return(df)
+}
+
+imputeEmbarked <- function(df){
+  df$imputeEmbarked <- df$Embarked
+  df$imputeEmbarked[which(is.na(df$imputeEmbarked))] <- 'S'
+  return(df)
+}
+
+imputeFareByPclass <- function(df){
+  df$Fare[ which( df$Fare == 0 )] <- NA
+  df$Fare <- imputeMedian(df$Fare, df$Pclass, as.numeric(levels(df$Pclass)))
+  return(df)
+}
+
+changeTitles <- function(df, old.titles, new.title) {
+  for (old in old.titles) {
+    df$newTitle[ which(df$newTitle == old)] <- new.title
+  }
+  return(df)
+}
+
+reassignTitle <- function(df){
+  df$newTitle <- as.character(df$title)
+  df <- changeTitles(df, c("Capt", "Col", "Don", "Dona", "Dr", "Jonkheer", "Lady", "Major", "Rev", "Sir"),"Noble")
+  df <- changeTitles(df, c("the Countess", "Ms"),"Mrs")
+  df <- changeTitles(df, c("Mlle", "Mme"),"Miss")
+  df$newTitle <- factor(df$newTitle)
+  return(df)
+}
+
+
+train.clean$title <- getTitle(train.clean)
+table(train.clean$title)
+train.clean <- reassignTitle(train.clean)
+train.clean <- imputeAgeByTitle(train.clean)
+train.clean[train.clean$title == "Dr",]
+train.clean <- imputeEmbarked(train.clean)
+#Impute Fare if 0 / missing
+train.clean <- imputeFareByPclass(train.clean)
+#Explore relationship between title and survival
+table(train.clean$title,train.clean$Survived)
+```
+
+What does the data look like after cleaning
+```{r}
+summary(train.clean)
+```
+
+# Build models without imputated value except imputeEmbarked
+
+  + Random forst
+  + Boosting with tree (gbm)
+
+```{r, message=FALSE, warning=FALSE}
+# No imputateAge
+train1.col <- c('Survived','Pclass','Sex','SibSp','Parch','Fare','imputeEmbarked')
+train1 <- train.clean[train1.col]
+train <- train1
+inTrain <- createDataPartition(y=train$Survived, p=0.75,list=FALSE)
+training <- train[inTrain,]
+testing <- train[-inTrain,]
+
+#train(method = "rf") throws an error when trying to fit a model that has NaN in the response variable.
+ctrl <- trainControl(method = "cv",number=20)
+modFit1<-train(factor(Survived)~.,data=training,method="rf",prox=TRUE,trControl=ctrl)
+pred.train<-predict(modFit1,training)
+cf1.train <- confusionMatrix(training$Survived,pred.train)
+pred.test<-predict(modFit1,testing)
+cf1.test <-confusionMatrix(testing$Survived,pred.test)
+
+modFit1.gbm<-train(factor(Survived)~.,data=training,method="gbm",trControl=ctrl,verbose=FALSE)
+pred.train.gbm<-predict(modFit1.gbm,training)
+cf1.train.gbm <- confusionMatrix(training$Survived,pred.train.gbm)
+pred.test.gbm<-predict(modFit1.gbm,testing)
+cf1.test.gbm <-confusionMatrix(testing$Survived,pred.test.gbm)
+```
+
+# Build a model with imputated value
+  + Random forst
+  + Boosting with tree (gbm)
+
+```{r, message=FALSE, warning=FALSE}
+train2.col <- c('Survived','Pclass','Sex','SibSp','Parch','Fare','newTitle','imputeAge','imputeEmbarked')
+train2 <- train.clean[train2.col]
+
+train <- train2
+inTrain <- createDataPartition(y=train$Survived, p=0.75,list=FALSE)
+training <- train[inTrain,]
+testing <- train[-inTrain,]
+
+ctrl <- trainControl(method = "cv",number=20)
+modFit2<-train(factor(Survived)~.,data=training,method="rf",prox=TRUE,trControl=ctrl)
+pred.train<-predict(modFit2,training)
+cf2.train <- confusionMatrix(training$Survived,pred.train)
+pred.test<-predict(modFit2,testing)
+cf2.test <- confusionMatrix(testing$Survived,pred.test)
+
+modFit2.gbm<-train(factor(Survived)~.,data=training,method="gbm",trControl=ctrl,verbose=FALSE)
+pred.train.gbm<-predict(modFit2.gbm,training)
+#varImp(modFit2.gbm)
+cf2.train.gbm <- confusionMatrix(training$Survived,pred.train.gbm)
+pred.test.gbm <-predict(modFit2.gbm,testing)
+cf2.test.gbm <- confusionMatrix(testing$Survived,pred.test.gbm)
+```
+
+# In sample and out of sample error of each model
+
+data: no imputation  
+model: random forest  
+```{r}
+as.numeric(1-cf1.train$overall["Accuracy"])
+#Out of sample error
+as.numeric(1-cf1.test$overall["Accuracy"])
+```
+
+data: no imputation  
+model: gbm  
+```{r}
+as.numeric(1-cf1.train.gbm$overall["Accuracy"])
+#Out of sample error
+as.numeric(1-cf1.test.gbm$overall["Accuracy"])
+```
+
+data: imputation  
+model: random forest  
+```{r}
+as.numeric(1-cf2.train$overall["Accuracy"])
+#Out of sample error
+as.numeric(1-cf2.test$overall["Accuracy"])
+```
+
+data: imputation  
+model: gbm  
+```{r,eval=FALSE}
+as.numeric(1-cf2.train.gbm$overall["Accuracy"])
+#Out of sample error
+as.numeric(1-cf2.test.gbm$overall["Accuracy"]) #*
+```
+
+# Prediction on test data
+
+The gbm model with imputed data has the highest accuracy and so it is applied on the test data. Imputation was done in the same way as the training data.
+
+```{r, message=FALSE, warning=FALSE,eval=FALSE}
+head(test.raw)
+summary(test.raw)
+test.clean <- test.raw
+factor.col.test <- c('Pclass','Sex','Embarked')
+test.clean <- convert2Factor(test.clean,factor.col.test)
+test.clean$title <- getTitle(test.clean)
+test.clean<- reassignTitle(test.clean)
+table(test.clean$title)
+table(test.clean$newTitle)
+test.clean <- imputeAgeByTitle(test.clean)
+#Impute Fare if 0 / missing
+test.clean <- imputeFareByPclass(test.clean)
+test.clean <- imputeEmbarked(test.clean)
+test.clean$imputeAge<-as.integer(test.clean$imputeAge)
+test.clean[which(is.na(test.clean$imputeAge)),]
+summary(test.clean)
+
+train2.col
+test.col <- c('Pclass','Sex','SibSp','Parch','Fare','newTitle','imputeAge','imputeEmbarked')
+rTest <- test.clean[test.col]
+pred.rTest<-predict(modFit2.gbm,rTest)
+out <- data.frame(PassengerId=test.clean$PassengerId, Survived=pred.rTest)
+write.csv(out,file="/Users/angelmak/Dropbox/Kaggle/Titanic/submission01_gbm.csv",col.names=T,row.names=F,quote=F)
+```
+
